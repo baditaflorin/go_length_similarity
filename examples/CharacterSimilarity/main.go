@@ -1,9 +1,10 @@
-// main.go
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/baditaflorin/go_length_similarity"
 	"github.com/baditaflorin/l"
@@ -27,14 +28,22 @@ func main() {
 	}
 	defer logger.Close()
 
-	// Initialize the length similarity metric.
-	ls := lengthsimilarity.New(
+	// Initialize the character similarity metric with a custom precision (e.g., 2 decimal places).
+	cs, err := lengthsimilarity.NewCharacterSimilarity(
 		lengthsimilarity.WithThreshold(0.8),
 		lengthsimilarity.WithMaxDiffRatio(0.2),
 		lengthsimilarity.WithLogger(logger),
+		lengthsimilarity.WithPrecision(2), // user can change this at runtime
 	)
+	if err != nil {
+		panic(err)
+	}
 
-	// Compute the similarity score between two texts.
-	result := ls.Compute("This is the original text.", "This is the augmented text!")
-	fmt.Printf("Result: %+v\n", result)
+	// Create a context with a timeout.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	// Compute the character similarity score between two texts.
+	result := cs.Compute(ctx, "This is the original text.", "This is the augmented text!")
+	fmt.Printf("Character Similarity Result: %+v\n", result)
 }
