@@ -11,7 +11,7 @@ import (
 )
 
 func main() {
-	// Create a custom logger.
+	// Create a custom logger using the original l package
 	factory := l.NewStandardFactory()
 	logger, err := factory.CreateLogger(l.Config{
 		Output:      os.Stdout,
@@ -28,22 +28,22 @@ func main() {
 	}
 	defer logger.Close()
 
-	// Initialize the character similarity metric with a custom precision (e.g., 2 decimal places).
+	// Initialize the character similarity metric using our new public API
 	cs, err := lengthsimilarity.NewCharacterSimilarity(
 		lengthsimilarity.WithThreshold(0.8),
 		lengthsimilarity.WithMaxDiffRatio(0.2),
 		lengthsimilarity.WithLogger(logger),
-		lengthsimilarity.WithPrecision(2), // user can change this at runtime
+		lengthsimilarity.WithPrecision(2),
 	)
 	if err != nil {
 		panic(err)
 	}
 
-	// Create a context with a timeout.
+	// Create a context with a timeout
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	// Compute the character similarity score between two texts.
+	// Compute the character similarity score between two texts
 	result := cs.Compute(ctx, "This is the original text.", "This is the augmented text!")
 	fmt.Printf("Character Similarity Result: %+v\n", result)
 }
