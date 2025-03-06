@@ -8,8 +8,8 @@
 package stream
 
 import (
-	"bufio"
 	"context"
+	"github.com/baditaflorin/go_length_similarity/internal/adapters/stream/lineprocessor"
 	"github.com/baditaflorin/go_length_similarity/internal/adapters/stream/wordprocessor"
 	"io"
 	"math"
@@ -37,8 +37,9 @@ type DefaultProcessor struct {
 	builderPool *pool.StringBuilderPool
 	chunkSize   int
 
-	// Word processor for optimized word-by-word processing
+	// Specialized processors for different modes
 	wordProcessor *wordprocessor.Processor
+	lineProcessor *lineprocessor.Processor
 }
 
 // NewDefaultProcessor creates a new default stream processor
@@ -50,6 +51,13 @@ func NewDefaultProcessor(logger ports.Logger, normalizer ports.Normalizer) *Defa
 		UseParallel: false,                // Disable parallel processing by default
 	})
 
+	// Initialize the optimized line processor
+	lineProc := lineprocessor.NewProcessor(logger, normalizer, lineprocessor.ProcessingConfig{
+		ChunkSize:   DefaultChunkSize * 8, // Larger chunks for line processing
+		BatchSize:   100,                  // Process lines in batches of 100
+		UseParallel: false,                // Disable parallel processing by default
+	})
+
 	return &DefaultProcessor{
 		logger:        logger,
 		normalizer:    normalizer,
@@ -58,6 +66,7 @@ func NewDefaultProcessor(logger ports.Logger, normalizer ports.Normalizer) *Defa
 		builderPool:   pool.NewStringBuilderPool(),
 		chunkSize:     DefaultChunkSize,
 		wordProcessor: wordProc,
+		lineProcessor: lineProc,
 	}
 }
 
@@ -67,12 +76,19 @@ func (p *DefaultProcessor) WithChunkSize(size int) *DefaultProcessor {
 	return p
 }
 
-// WithParallelWordProcessing enables parallel word processing
-func (p *DefaultProcessor) WithParallelWordProcessing(enable bool) *DefaultProcessor {
-	// Create a new word processor with parallel enabled/disabled
+// WithParallelProcessing enables parallel processing for specific modes
+func (p *DefaultProcessor) WithParallelProcessing(enable bool) *DefaultProcessor {
+	// Update word processor
 	p.wordProcessor = wordprocessor.NewProcessor(p.logger, p.normalizer, wordprocessor.ProcessingConfig{
 		ChunkSize:   p.chunkSize * 8, // Larger chunks for word processing
 		BatchSize:   1000,            // Process words in batches of 1000
+		UseParallel: enable,          // Set parallel processing as requested
+	})
+
+	// Update line processor
+	p.lineProcessor = lineprocessor.NewProcessor(p.logger, p.normalizer, lineprocessor.ProcessingConfig{
+		ChunkSize:   p.chunkSize * 8, // Larger chunks for line processing
+		BatchSize:   100,             // Process lines in batches of 100
 		UseParallel: enable,          // Set parallel processing as requested
 	})
 
@@ -96,7 +112,8 @@ func (p *DefaultProcessor) ProcessStream(ctx context.Context, reader io.Reader, 
 	case ports.ChunkByChunk:
 		count, bytesProcessed, err = p.processChunks(ctx, reader, nil)
 	case ports.LineByLine:
-		count, bytesProcessed, err = p.processLines(ctx, reader, nil)
+		// Use optimized line processor
+		count, bytesProcessed, err = p.lineProcessor.ProcessLines(ctx, reader, nil)
 	case ports.WordByWord:
 		// Use optimized word processor
 		count, bytesProcessed, err = p.wordProcessor.ProcessWords(ctx, reader, nil)
@@ -145,7 +162,8 @@ func (p *DefaultProcessor) ProcessStreamWithWriter(ctx context.Context, reader i
 	case ports.ChunkByChunk:
 		count, bytesProcessed, err = p.processChunks(ctx, reader, writer)
 	case ports.LineByLine:
-		count, bytesProcessed, err = p.processLines(ctx, reader, writer)
+		// Use optimized line processor
+		count, bytesProcessed, err = p.lineProcessor.ProcessLines(ctx, reader, writer)
 	case ports.WordByWord:
 		// Use optimized word processor
 		count, bytesProcessed, err = p.wordProcessor.ProcessWords(ctx, reader, writer)
@@ -226,102 +244,6 @@ func (p *DefaultProcessor) processChunks(ctx context.Context, reader io.Reader, 
 	}
 
 	return count, totalBytes, lastErr
-}
-
-// processLines processes the input line by line
-func (p *DefaultProcessor) processLines(ctx context.Context, reader io.Reader, writer io.Writer) (int, int64, error) {
-	scanner := bufio.NewScanner(reader)
-
-	// Increase scanner buffer size to handle longer lines
-	// This should fix the "token too long" error
-	scannerBuffer := make([]byte, MaxScannerBufferSize)
-	scanner.Buffer(scannerBuffer, MaxScannerBufferSize)
-
-	count := 0
-	var totalBytes int64 = 0
-
-	for scanner.Scan() {
-		// Check context for cancellation
-		select {
-		case <-ctx.Done():
-			p.logger.Warn("Processing cancelled by context", "error", ctx.Err())
-			return count, totalBytes, ctx.Err()
-		default:
-			// Continue processing
-		}
-
-		line := scanner.Text()
-		lineLen := len(line)
-		totalBytes += int64(lineLen + 1) // +1 for the newline
-
-		// Process line
-		normalized := p.normalizer.Normalize(line)
-		count += len([]rune(normalized))
-
-		// Write normalized output if writer is provided
-		if writer != nil {
-			_, err := writer.Write([]byte(normalized + "\n"))
-			if err != nil {
-				p.logger.Error("Error writing to output", "error", err)
-				return count, totalBytes, err
-			}
-		}
-	}
-
-	if err := scanner.Err(); err != nil {
-		p.logger.Warn("Error scanning input", "error", err)
-		return count, totalBytes, err
-	}
-
-	return count, totalBytes, nil
-}
-
-// processWords processes the input word by word
-func (p *DefaultProcessor) processWords(ctx context.Context, reader io.Reader, writer io.Writer) (int, int64, error) {
-	scanner := bufio.NewScanner(reader)
-	scanner.Split(bufio.ScanWords)
-
-	// Increase scanner buffer to handle longer words
-	scannerBuffer := make([]byte, MaxScannerBufferSize)
-	scanner.Buffer(scannerBuffer, MaxScannerBufferSize)
-
-	count := 0
-	var totalBytes int64 = 0
-
-	for scanner.Scan() {
-		// Check context for cancellation
-		select {
-		case <-ctx.Done():
-			p.logger.Warn("Processing cancelled by context", "error", ctx.Err())
-			return count, totalBytes, ctx.Err()
-		default:
-			// Continue processing
-		}
-
-		word := scanner.Text()
-		wordLen := len(word)
-		totalBytes += int64(wordLen + 1) // +1 for the whitespace
-
-		// Process word (count is just word count here)
-		count++
-
-		// Write normalized output if writer is provided
-		if writer != nil {
-			normalized := p.normalizer.Normalize(word)
-			_, err := writer.Write([]byte(normalized + " "))
-			if err != nil {
-				p.logger.Error("Error writing to output", "error", err)
-				return count, totalBytes, err
-			}
-		}
-	}
-
-	if err := scanner.Err(); err != nil {
-		p.logger.Warn("Error scanning input", "error", err)
-		return count, totalBytes, err
-	}
-
-	return count, totalBytes, nil
 }
 
 // StreamingCalculator extends the regular calculator with streaming capabilities
