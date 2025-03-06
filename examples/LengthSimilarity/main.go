@@ -6,7 +6,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/baditaflorin/go_length_similarity"
+	"github.com/baditaflorin/go_length_similarity/pkg/word"
 	"github.com/baditaflorin/l"
 )
 
@@ -29,10 +29,10 @@ func main() {
 	defer logger.Close()
 
 	// Initialize the length similarity metric using our new public API
-	ls, err := lengthsimilarity.New(
-		lengthsimilarity.WithThreshold(0.8),
-		lengthsimilarity.WithMaxDiffRatio(0.2),
-		lengthsimilarity.WithLogger(logger),
+	ls, err := word.New(
+		word.WithThreshold(0.8),
+		word.WithMaxDiffRatio(0.2),
+		word.WithLogger(logger),
 	)
 	if err != nil {
 		panic(err)

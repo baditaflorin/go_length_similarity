@@ -6,7 +6,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/baditaflorin/go_length_similarity"
+	"github.com/baditaflorin/go_length_similarity/pkg/character"
 	"github.com/baditaflorin/l"
 )
 
@@ -29,11 +29,11 @@ func main() {
 	defer logger.Close()
 
 	// Initialize the character similarity metric using our new public API
-	cs, err := lengthsimilarity.NewCharacterSimilarity(
-		lengthsimilarity.WithThreshold(0.8),
-		lengthsimilarity.WithMaxDiffRatio(0.2),
-		lengthsimilarity.WithLogger(logger),
-		lengthsimilarity.WithPrecision(2),
+	cs, err := character.NewCharacterSimilarity(
+		character.WithThreshold(0.8),
+		character.WithMaxDiffRatio(0.2),
+		character.WithLogger(logger),
+		character.WithPrecision(2),
 	)
 	if err != nil {
 		panic(err)

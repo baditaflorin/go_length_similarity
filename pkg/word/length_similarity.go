@@ -1,4 +1,4 @@
-package lengthsimilarity
+package word
 
 import (
 	"context"
@@ -8,6 +8,7 @@ import (
 	"github.com/baditaflorin/go_length_similarity/internal/core/domain"
 	"github.com/baditaflorin/go_length_similarity/internal/core/length"
 	"github.com/baditaflorin/go_length_similarity/internal/ports"
+	"github.com/baditaflorin/go_length_similarity/internal/warmup"
 	"github.com/baditaflorin/l"
 )
 
@@ -15,6 +16,8 @@ import (
 type LengthSimilarity struct {
 	calculator ports.SimilarityCalculator
 	logger     ports.Logger
+	normalizer ports.Normalizer
+	warmed     bool
 }
 
 // LengthSimilarityOption defines a functional option for configuring LengthSimilarity.
@@ -25,6 +28,8 @@ type lengthSimilarityConfig struct {
 	MaxDiffRatio float64
 	Logger       ports.Logger
 	Normalizer   ports.Normalizer
+	WarmUp       bool
+	WarmUpConfig warmup.WarmupConfig
 }
 
 // WithThreshold sets a custom threshold for length similarity.
@@ -55,6 +60,37 @@ func WithNormalizer(normalizer ports.Normalizer) LengthSimilarityOption {
 	}
 }
 
+// WithFastNormalizer sets the optimized fast normalizer.
+func WithFastNormalizer() LengthSimilarityOption {
+	return func(cfg *lengthSimilarityConfig) {
+		normFactory := normalizer.NewNormalizerFactory()
+		cfg.Normalizer = normFactory.CreateNormalizer(normalizer.FastNormalizerType)
+	}
+}
+
+// WithOptimizedNormalizer sets the optimized normalizer.
+func WithOptimizedNormalizer() LengthSimilarityOption {
+	return func(cfg *lengthSimilarityConfig) {
+		normFactory := normalizer.NewNormalizerFactory()
+		cfg.Normalizer = normFactory.CreateNormalizer(normalizer.OptimizedNormalizerType)
+	}
+}
+
+// WithWarmUp enables system warm-up on initialization.
+func WithWarmUp(enable bool) LengthSimilarityOption {
+	return func(cfg *lengthSimilarityConfig) {
+		cfg.WarmUp = enable
+	}
+}
+
+// WithWarmUpConfig sets a custom warm-up configuration.
+func WithWarmUpConfig(config warmup.WarmupConfig) LengthSimilarityOption {
+	return func(cfg *lengthSimilarityConfig) {
+		cfg.WarmUpConfig = config
+		cfg.WarmUp = true
+	}
+}
+
 // New creates a new LengthSimilarity instance.
 func New(opts ...LengthSimilarityOption) (*LengthSimilarity, error) {
 	// Default configuration
@@ -63,6 +99,8 @@ func New(opts ...LengthSimilarityOption) (*LengthSimilarity, error) {
 	config := &lengthSimilarityConfig{
 		Threshold:    defaultConfig.Threshold,
 		MaxDiffRatio: defaultConfig.MaxDiffRatio,
+		WarmUp:       false,
+		WarmUpConfig: warmup.DefaultWarmupConfig(),
 	}
 
 	// Apply options
@@ -94,13 +132,37 @@ func New(opts ...LengthSimilarityOption) (*LengthSimilarity, error) {
 		return nil, err
 	}
 
-	return &LengthSimilarity{
+	ls := &LengthSimilarity{
 		calculator: calculator,
 		logger:     config.Logger,
-	}, nil
+		normalizer: config.Normalizer,
+		warmed:     false,
+	}
+
+	// Perform warm-up if configured
+	if config.WarmUp {
+		ls.WarmUp(context.Background(), config.WarmUpConfig)
+	}
+
+	return ls, nil
 }
 
 // Compute calculates the word-level length similarity between two texts.
 func (ls *LengthSimilarity) Compute(ctx context.Context, original, augmented string) domain.Result {
 	return ls.calculator.Compute(ctx, original, augmented)
+}
+
+// WarmUp performs system warm-up to optimize performance.
+func (ls *LengthSimilarity) WarmUp(ctx context.Context, config warmup.WarmupConfig) {
+	if ls.warmed {
+		ls.logger.Debug("System already warmed up, skipping")
+		return
+	}
+
+	warmupMgr := warmup.NewManager(ls.logger, config)
+	warmupMgr.RegisterCalculator(ls.calculator)
+	warmupMgr.RegisterNormalizer(ls.normalizer)
+
+	warmupMgr.WarmUp(ctx)
+	ls.warmed = true
 }
