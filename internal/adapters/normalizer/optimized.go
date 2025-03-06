@@ -9,50 +9,128 @@ import (
 
 // OptimizedNormalizer implements an optimized text normalization strategy with buffer pooling
 type OptimizedNormalizer struct {
-	runePool    *pool.RuneBufferPool
-	builderPool *pool.StringBuilderPool
+	// Pre-computed decision table for ASCII characters (0-127)
+	asciiTable [128]byte
+
+	// Reusable buffer pool - only need one buffer type
+	bytePool *pool.BufferPool
 }
 
 // NewOptimizedNormalizer creates a new optimized normalizer
 func NewOptimizedNormalizer() ports.Normalizer {
-	return &OptimizedNormalizer{
-		runePool:    pool.NewRuneBufferPool(8192), // 8K runes initial capacity
-		builderPool: pool.NewStringBuilderPool(),
+	n := &OptimizedNormalizer{
+		bytePool: pool.NewBufferPool(8192), // 8K bytes initial capacity
 	}
+
+	// Initialize lookup table for ASCII characters
+	// 0 = keep as is
+	// 1 = replace with space
+	// 2 = convert to lowercase
+	for i := 0; i < 128; i++ {
+		r := rune(i)
+		if unicode.IsPunct(r) || unicode.IsSpace(r) {
+			// Replace punctuation and whitespace with space
+			n.asciiTable[i] = 1
+		} else if unicode.IsUpper(r) {
+			// Convert uppercase to lowercase
+			n.asciiTable[i] = 2
+		} else {
+			// Keep as is
+			n.asciiTable[i] = 0
+		}
+	}
+
+	return n
 }
 
 // Normalize converts the input text to lower case and replaces punctuation with spaces efficiently
 func (n *OptimizedNormalizer) Normalize(text string) string {
-	// No processing needed for empty strings
+	// Fast path for empty strings
 	if len(text) == 0 {
 		return ""
 	}
 
-	// Get reusable buffers from the pools
-	runeBuffer := n.runePool.Get()
-	defer n.runePool.Put(runeBuffer)
-
-	sb := n.builderPool.Get()
-	defer n.builderPool.Put(sb)
-
-	// Pre-allocate capacity if needed by appending to the slice
-	textRunes := []rune(text)
-	if cap(*runeBuffer) < len(textRunes) {
-		// Expand capacity if needed
-		*runeBuffer = make([]rune, 0, len(textRunes))
-	}
-
-	// Process the text in a single pass
-	for _, r := range textRunes {
-		if unicode.IsPunct(r) {
-			sb.WriteRune(' ')
-		} else {
-			// Convert to lowercase as we go
-			sb.WriteRune(unicode.ToLower(r))
+	// Check for ASCII-only string first (optimization)
+	asciiOnly := true
+	for i := 0; i < len(text); i++ {
+		if text[i] >= 128 {
+			asciiOnly = false
+			break
 		}
 	}
 
-	return sb.String()
+	// Get a reusable buffer from the pool
+	buffer := n.bytePool.Get()
+	defer n.bytePool.Put(buffer)
+
+	// Ensure the buffer has adequate capacity
+	if cap(*buffer) < len(text) {
+		*buffer = make([]byte, 0, len(text))
+	}
+	*buffer = (*buffer)[:0] // Reset length while keeping capacity
+
+	if asciiOnly {
+		// Fast path for ASCII-only strings
+		var lastWasSpace bool
+		for i := 0; i < len(text); i++ {
+			b := text[i]
+			switch n.asciiTable[b] {
+			case 0: // Keep as is
+				*buffer = append(*buffer, b)
+				lastWasSpace = false
+			case 1: // Replace with space
+				// Avoid consecutive spaces
+				if !lastWasSpace {
+					*buffer = append(*buffer, ' ')
+					lastWasSpace = true
+				}
+			case 2: // Convert to lowercase (ASCII)
+				*buffer = append(*buffer, b+('a'-'A'))
+				lastWasSpace = false
+			}
+		}
+
+		return string(*buffer)
+	}
+
+	// Slower path for mixed ASCII/Unicode strings
+	var lastWasSpace bool
+	for _, r := range text {
+		if r < 128 {
+			// ASCII character - use lookup table
+			switch n.asciiTable[r] {
+			case 0: // Keep as is
+				*buffer = append(*buffer, byte(r))
+				lastWasSpace = false
+			case 1: // Replace with space
+				// Avoid consecutive spaces
+				if !lastWasSpace {
+					*buffer = append(*buffer, ' ')
+					lastWasSpace = true
+				}
+			case 2: // Convert to lowercase (ASCII)
+				*buffer = append(*buffer, byte(r)+('a'-'A'))
+				lastWasSpace = false
+			}
+		} else {
+			// Non-ASCII character
+			if unicode.IsPunct(r) || unicode.IsSpace(r) {
+				// Replace punctuation with space
+				if !lastWasSpace {
+					*buffer = append(*buffer, ' ')
+					lastWasSpace = true
+				}
+			} else {
+				// Convert to lowercase and append the UTF-8 bytes
+				lower := unicode.ToLower(r)
+				runeBytes := []byte(string(lower))
+				*buffer = append(*buffer, runeBytes...)
+				lastWasSpace = false
+			}
+		}
+	}
+
+	return string(*buffer)
 }
 
 // FastNormalizer offers an even faster normalization with pre-cached decisions

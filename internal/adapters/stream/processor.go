@@ -10,6 +10,7 @@ package stream
 import (
 	"bufio"
 	"context"
+	"github.com/baditaflorin/go_length_similarity/internal/adapters/stream/wordprocessor"
 	"io"
 	"math"
 	"time"
@@ -35,17 +36,28 @@ type DefaultProcessor struct {
 	runePool    *pool.RuneBufferPool
 	builderPool *pool.StringBuilderPool
 	chunkSize   int
+
+	// Word processor for optimized word-by-word processing
+	wordProcessor *wordprocessor.Processor
 }
 
 // NewDefaultProcessor creates a new default stream processor
 func NewDefaultProcessor(logger ports.Logger, normalizer ports.Normalizer) *DefaultProcessor {
+	// Initialize the optimized word processor
+	wordProc := wordprocessor.NewProcessor(logger, normalizer, wordprocessor.ProcessingConfig{
+		ChunkSize:   DefaultChunkSize * 8, // Larger chunks for word processing
+		BatchSize:   1000,                 // Process words in batches of 1000
+		UseParallel: false,                // Disable parallel processing by default
+	})
+
 	return &DefaultProcessor{
-		logger:      logger,
-		normalizer:  normalizer,
-		bufferPool:  pool.NewBufferPool(DefaultChunkSize),
-		runePool:    pool.NewRuneBufferPool(DefaultChunkSize),
-		builderPool: pool.NewStringBuilderPool(),
-		chunkSize:   DefaultChunkSize,
+		logger:        logger,
+		normalizer:    normalizer,
+		bufferPool:    pool.NewBufferPool(DefaultChunkSize),
+		runePool:      pool.NewRuneBufferPool(DefaultChunkSize),
+		builderPool:   pool.NewStringBuilderPool(),
+		chunkSize:     DefaultChunkSize,
+		wordProcessor: wordProc,
 	}
 }
 
@@ -55,7 +67,18 @@ func (p *DefaultProcessor) WithChunkSize(size int) *DefaultProcessor {
 	return p
 }
 
-// ProcessStream processes an input stream and returns the length (character or word count)
+// WithParallelWordProcessing enables parallel word processing
+func (p *DefaultProcessor) WithParallelWordProcessing(enable bool) *DefaultProcessor {
+	// Create a new word processor with parallel enabled/disabled
+	p.wordProcessor = wordprocessor.NewProcessor(p.logger, p.normalizer, wordprocessor.ProcessingConfig{
+		ChunkSize:   p.chunkSize * 8, // Larger chunks for word processing
+		BatchSize:   1000,            // Process words in batches of 1000
+		UseParallel: enable,          // Set parallel processing as requested
+	})
+
+	return p
+}
+
 func (p *DefaultProcessor) ProcessStream(ctx context.Context, reader io.Reader, mode ports.StreamingMode) (int, error) {
 	startTime := time.Now()
 
@@ -75,7 +98,8 @@ func (p *DefaultProcessor) ProcessStream(ctx context.Context, reader io.Reader, 
 	case ports.LineByLine:
 		count, bytesProcessed, err = p.processLines(ctx, reader, nil)
 	case ports.WordByWord:
-		count, bytesProcessed, err = p.processWords(ctx, reader, nil)
+		// Use optimized word processor
+		count, bytesProcessed, err = p.wordProcessor.ProcessWords(ctx, reader, nil)
 	}
 
 	if err != nil && err != io.EOF {
@@ -123,7 +147,8 @@ func (p *DefaultProcessor) ProcessStreamWithWriter(ctx context.Context, reader i
 	case ports.LineByLine:
 		count, bytesProcessed, err = p.processLines(ctx, reader, writer)
 	case ports.WordByWord:
-		count, bytesProcessed, err = p.processWords(ctx, reader, writer)
+		// Use optimized word processor
+		count, bytesProcessed, err = p.wordProcessor.ProcessWords(ctx, reader, writer)
 	}
 
 	if err != nil && err != io.EOF {
