@@ -3,28 +3,41 @@ package lineprocessor
 import (
 	"bytes"
 	"context"
-	"io"
-	"time"
-
 	"github.com/baditaflorin/go_length_similarity/internal/ports"
+	"io"
+	"sync"
+	"time"
 )
 
-// Constants for line processing
-const (
-	// DefaultChunkSize defines the default size of each chunk for reading
-	DefaultChunkSize = 64 * 1024 // 64KB
-
-	// DefaultBatchSize defines how many lines to process in one batch
-	DefaultBatchSize = 100
-
-	// ContextCheckFrequency defines how often to check for context cancellation
-	ContextCheckFrequency = 500 // lines
-
-	// Common newline characters
-	CR = '\r'
-	LF = '\n'
-)
-
+// import (
+//
+//	"bytes"
+//	"context"
+//	"io"
+//	"time"
+//
+//	"github.com/baditaflorin/go_length_similarity/internal/ports"
+//
+// )
+//
+// // Constants for line processing
+// const (
+//
+//	// DefaultChunkSize defines the default size of each chunk for reading
+//	DefaultChunkSize = 64 * 1024 // 64KB
+//
+//	// DefaultBatchSize defines how many lines to process in one batch
+//	DefaultBatchSize = 100
+//
+//	// ContextCheckFrequency defines how often to check for context cancellation
+//	ContextCheckFrequency = 500 // lines
+//
+//	// Common newline characters
+//	CR = '\r'
+//	LF = '\n'
+//
+// )
+//
 // Processor implements optimized line processing
 type Processor struct {
 	logger     ports.Logger
@@ -41,13 +54,14 @@ type Processor struct {
 	useParallel bool
 }
 
-// ProcessingConfig defines configuration for line processing
-type ProcessingConfig struct {
-	ChunkSize   int
-	BatchSize   int
-	UseParallel bool
-}
-
+// // ProcessingConfig defines configuration for line processing
+//
+//	type ProcessingConfig struct {
+//		ChunkSize   int
+//		BatchSize   int
+//		UseParallel bool
+//	}
+//
 // NewProcessor creates a new optimized line processor
 func NewProcessor(
 	logger ports.Logger,
@@ -84,6 +98,214 @@ func (p *Processor) ProcessLines(
 		return p.processLinesParallel(ctx, reader, writer)
 	}
 	return p.processLinesOptimized(ctx, reader, writer)
+}
+
+// processLinesParallel implements a parallel line processing algorithm
+func (p *Processor) processLinesParallel(
+	ctx context.Context,
+	reader io.Reader,
+	writer io.Writer,
+) (int, int64, error) {
+	startTime := time.Now()
+
+	// Define the number of workers for parallel processing
+	numWorkers := 4 // This could be made configurable or based on runtime.NumCPU()
+
+	// Create channels for communication between workers
+	jobs := make(chan []byte, p.batchSize)
+	results := make(chan int, numWorkers)
+	errChan := make(chan error, 1)
+	doneChan := make(chan struct{})
+
+	// Variable to track total bytes processed
+	var bytesProcessed int64
+
+	// Start workers
+	var wg sync.WaitGroup
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			for line := range jobs {
+				// Check for context cancellation
+				select {
+				case <-ctx.Done():
+					return
+				default:
+					// Process the line
+					normalized := p.normalizer.Normalize(string(line))
+					charCount := len([]rune(normalized))
+
+					// Send result back
+					results <- charCount
+
+					// Write normalized output if writer is provided
+					if writer != nil {
+						writer.Write([]byte(normalized + "\n"))
+					}
+				}
+			}
+		}()
+	}
+
+	// Close the results channel when all workers are done
+	go func() {
+		wg.Wait()
+		close(results)
+		close(doneChan)
+	}()
+
+	// Start a goroutine to read lines and send them to workers
+	go func() {
+		chunkBuffer := p.chunkBufferPool.Get()
+		defer p.chunkBufferPool.Put(chunkBuffer)
+
+		var partialLine []byte
+
+		for {
+			// Check for context cancellation
+			select {
+			case <-ctx.Done():
+				close(jobs)
+				errChan <- ctx.Err()
+				return
+			default:
+				// Continue reading
+			}
+
+			// Read a chunk
+			n, err := reader.Read(chunkBuffer.Bytes)
+			if n > 0 {
+				bytesProcessed += int64(n)
+				chunk := chunkBuffer.Bytes[:n]
+
+				// Process the chunk to find lines
+				var lines [][]byte
+
+				// If we have a partial line from the previous chunk, handle it
+				if len(partialLine) > 0 {
+					// Find the first newline in this chunk
+					newlineIdx := bytes.IndexByte(chunk, LF)
+					if newlineIdx >= 0 {
+						// Complete the partial line
+						completeLine := make([]byte, len(partialLine)+newlineIdx)
+						copy(completeLine, partialLine)
+						copy(completeLine[len(partialLine):], chunk[:newlineIdx])
+
+						// Send this line to be processed
+						select {
+						case jobs <- completeLine:
+							// Continue
+						case <-ctx.Done():
+							close(jobs)
+							errChan <- ctx.Err()
+							return
+						}
+
+						// Process the rest of the chunk
+						lines = bytes.Split(chunk[newlineIdx+1:], []byte{LF})
+						partialLine = nil
+					} else {
+						// No newline found - the entire chunk is part of the partial line
+						newPartial := make([]byte, len(partialLine)+n)
+						copy(newPartial, partialLine)
+						copy(newPartial[len(partialLine):], chunk)
+						partialLine = newPartial
+						continue
+					}
+				} else {
+					// No partial line, process the whole chunk
+					lines = bytes.Split(chunk, []byte{LF})
+				}
+
+				// Process complete lines
+				if len(lines) > 0 {
+					// Check if the last line is complete (ends with newline)
+					lastLine := lines[len(lines)-1]
+					if n > 0 && chunk[n-1] != LF {
+						// Last line is incomplete, save it for the next chunk
+						partialLine = lastLine
+						lines = lines[:len(lines)-1]
+					}
+
+					// Send complete lines to workers
+					for _, line := range lines {
+						if len(line) > 0 {
+							select {
+							case jobs <- line:
+								// Continue
+							case <-ctx.Done():
+								close(jobs)
+								errChan <- ctx.Err()
+								return
+							}
+						}
+					}
+				}
+			}
+
+			// Handle errors or EOF
+			if err != nil {
+				// Process any remaining partial line
+				if len(partialLine) > 0 {
+					select {
+					case jobs <- partialLine:
+						// Sent successfully
+					case <-ctx.Done():
+						close(jobs)
+						errChan <- ctx.Err()
+						return
+					}
+				}
+
+				// Close the jobs channel to signal no more jobs
+				close(jobs)
+
+				if err != io.EOF {
+					errChan <- err
+				} else {
+					errChan <- nil // Normal EOF
+				}
+				return
+			}
+		}
+	}()
+
+	// Collect results from workers
+	charCount := 0
+	var processingErr error
+
+	// Process results
+	resultsDone := false
+	for !resultsDone {
+		select {
+		case count, ok := <-results:
+			if !ok {
+				resultsDone = true
+			} else {
+				charCount += count
+			}
+		case err := <-errChan:
+			if err != nil && err != io.EOF {
+				processingErr = err
+			}
+		case <-ctx.Done():
+			return charCount, bytesProcessed, ctx.Err()
+		}
+	}
+
+	// Wait for processing to complete
+	<-doneChan
+
+	// Log completion
+	p.logger.Debug("Parallel line processing completed",
+		"char_count", charCount,
+		"bytes_processed", bytesProcessed,
+		"duration", time.Since(startTime),
+	)
+
+	return charCount, bytesProcessed, processingErr
 }
 
 // processLinesOptimized implements an optimized single-threaded line processing algorithm
